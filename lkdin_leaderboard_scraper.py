@@ -338,35 +338,234 @@ class LinkedInLeaderboardScraper:
     # Returns True on success, False on failure
     # ------------------------------------------------------------------
 
-    async def scrape_game(self, game_key, game_name):
+    # ------------------------------------------------------------------
+    # Helper to load URL with retries & page reload on failure
+    # ------------------------------------------------------------------
+
+    async def _goto_with_retry(self, page, url, game_name, max_retries=2, timeout=12000):
+        for attempt in range(1, max_retries + 1):
+            try:
+                await page.goto(url, wait_until="domcontentloaded", timeout=timeout)
+                await asyncio.sleep(0.5)
+                return True
+            except Exception as e:
+                print(f"    [{game_name}] Navigation attempt {attempt}/{max_retries} failed for {url}: {e}")
+                if attempt < max_retries:
+                    await asyncio.sleep(1)
+                    try:
+                        print(f"    [{game_name}] Reloading page (attempt {attempt + 1})...")
+                        await page.reload(wait_until="domcontentloaded", timeout=timeout)
+                        await asyncio.sleep(0.5)
+                        return True
+                    except Exception as re_err:
+                        print(f"    [{game_name}] Reload failed: {re_err}")
+        return False
+
+    # ------------------------------------------------------------------
+    # Scrape a single game
+    # Returns (game_name, success, players, avg, failures)
+    # ------------------------------------------------------------------
+
+    async def scrape_game(self, page, game_key, game_name):
         print(f"\n-- {game_name} --")
         failures = []
+        avg_found = None
+        players = []
 
         # Step 1: Results page -> user score + average
         results_url = RESULTS_URL.format(game=game_key)
-        print(f"  Loading results page: {results_url}")
+        print(f"  [{game_name}] Loading results page: {results_url}")
         user_score_results = None
         try:
-            await self._load_page(results_url)
-            user_score_results, avg = await self.extract_results_page(game_key)
-            if avg:
-                self.all_averages[game_name] = avg
+            await self._goto_with_retry(page, results_url, game_name)
+
+            # Extract results page elements with retry/reload if missing selector
+            try:
+                await page.wait_for_selector(
+                    ".pr-connections-leaderboard-player__container, .pr-golden-chiclet",
+                    timeout=15000,
+                )
+            except PlaywrightTimeoutError:
+                print(f"    [{game_name}] Elements not found on results page. Retrying page reload...")
+                try:
+                    await page.reload(wait_until="domcontentloaded", timeout=12000)
+                    await page.wait_for_selector(
+                        ".pr-connections-leaderboard-player__container, .pr-golden-chiclet",
+                        timeout=12000,
+                    )
+                except Exception:
+                    print(f"    [{game_name}] Warning: Results elements still not found after reload.")
+
+            # Try to find "You" in the leaderboard preview on the results page
+            try:
+                containers = await page.query_selector_all(
+                    ".pr-connections-leaderboard-player__container"
+                )
+                for c in containers:
+                    try:
+                        name_el = await c.query_selector(
+                            ".pr-connections-leaderboard-player__name"
+                        )
+                        if name_el and (await name_el.inner_text()).strip() == "You":
+                            score_el = await c.query_selector(
+                                ".pr-connections-leaderboard-player__score"
+                            )
+                            if score_el:
+                                raw = clean_score((await score_el.inner_text()).strip())
+                                if raw and raw != "--":
+                                    user_score_results = raw
+                                    print(f"    [{game_name}] User score (results page): {user_score_results}")
+                                    break
+                    except Exception:
+                        continue
+            except Exception:
+                pass
+
+            if not user_score_results:
+                try:
+                    raw = await page.evaluate("""() => {
+                        const subtexts = document.querySelectorAll('.pr-golden-chiclet__subtext');
+                        for (const st of subtexts) {
+                            const txt = (st.innerText || '').toLowerCase();
+                            if (!txt.includes('avg:')) continue;
+                            let sib = st.previousElementSibling;
+                            while (sib) {
+                                if (sib.classList.contains('pr-golden-chiclet__text')) {
+                                    return (sib.innerText || '').trim();
+                                }
+                                sib = sib.previousElementSibling;
+                            }
+                        }
+                        return null;
+                    }""")
+                    if raw:
+                        raw = clean_score(raw)
+                        m = re.search(r"solved in (\d+)", raw, re.IGNORECASE)
+                        if m:
+                            raw = m.group(1)
+                        if raw and raw != "--":
+                            user_score_results = raw
+                            print(f"    [{game_name}] User score (results page fallback): {user_score_results}")
+                except Exception:
+                    pass
+
+            try:
+                subtexts = await page.query_selector_all(".pr-golden-chiclet__subtext")
+                for st in subtexts:
+                    try:
+                        text = (await st.inner_text() or "").strip()
+                    except Exception:
+                        continue
+                    if "avg:" in text.lower():
+                        idx = text.lower().find("avg:")
+                        if idx != -1:
+                            avg_raw = text[idx + 4:].strip()
+                            avg_raw = clean_score(avg_raw)
+                            if avg_raw and avg_raw != "--":
+                                avg_found = avg_raw
+                                print(f"    [{game_name}] Average (results page): {avg_found}")
+                        break
+            except Exception:
+                pass
+
+            if avg_found:
+                self.all_averages[game_name] = avg_found
             else:
                 failures.append("average not found on results page")
+
             if not user_score_results:
                 failures.append("personal score not found on results page")
+
         except Exception as e:
-            print(f"  Warning: Error on results page: {e}")
+            print(f"  [{game_name}] Warning: Error on results page: {e}")
             failures.append(f"results page exception: {e}")
 
         # Step 2: Leaderboard page -> all ranked players
         lb_url = LEADERBOARD_URL.format(game=game_key)
-        print(f"  Loading leaderboard: {lb_url}")
+        print(f"  [{game_name}] Loading leaderboard: {lb_url}")
         try:
-            await self._load_page(lb_url)
-            players = await self.extract_leaderboard_data(game_key)
+            await self._goto_with_retry(page, lb_url, game_name)
+
+            print(f"    [{game_name}] Extracting leaderboard entries...")
+            try:
+                await page.wait_for_selector(
+                    ".pr-connections-leaderboard-player__container",
+                    timeout=15000,
+                )
+            except PlaywrightTimeoutError:
+                print(f"    [{game_name}] Leaderboard containers missing. Retrying page reload...")
+                try:
+                    await page.reload(wait_until="domcontentloaded", timeout=15000)
+                    await page.wait_for_selector(
+                        ".pr-connections-leaderboard-player__container",
+                        timeout=15000,
+                    )
+                except Exception:
+                    print(f"    [{game_name}] Warning: Leaderboard containers still missing after reload.")
+
+            script = """(gameKey) => {
+                const isTimed   = ['mini-sudoku','zip','crossclimb','queens','tango','patches'].includes(gameKey);
+                const isPinpoint = gameKey === 'pinpoint';
+
+                function parseScore(raw) {
+                    if (!raw) return null;
+                    raw = raw.replace(/^['\u2019`"]+/, '').trim();
+                    if (!raw || raw === '--' || raw === '-') return null;
+                    if (/^\\d+:\\d{2}$/.test(raw)) return raw;
+                    if (/^\\d+$/.test(raw)) {
+                        if (isPinpoint) return raw;
+                        if (isTimed) return null;
+                        return raw;
+                    }
+                    return null;
+                }
+
+                const contentSection = document.querySelector('.pr-connections-leaderboard__content');
+                const containers = contentSection
+                    ? Array.from(contentSection.querySelectorAll('.pr-connections-leaderboard-player__container'))
+                    : Array.from(document.querySelectorAll('.pr-connections-leaderboard-player__container'));
+
+                const players = [];
+                containers.forEach(el => {
+                    const nameEl = el.querySelector(
+                        '.pr-connections-leaderboard-player__content-column .text-body-medium-bold'
+                    );
+                    const name = nameEl ? nameEl.innerText.trim() : null;
+                    if (!name) return;
+
+                    const scoreEl = el.querySelector(
+                        '.pr-connections-leaderboard-player__score.text-body-medium.ml1, ' +
+                        '.pr-connections-leaderboard-player__score'
+                    );
+                    const score = scoreEl ? parseScore(scoreEl.innerText.trim()) : null;
+                    if (!score) return;
+
+                    players.push({ name, score });
+                });
+
+                return players;
+            }"""
+
+            try:
+                raw_players = await page.evaluate(script, game_key)
+            except Exception as e:
+                print(f"    [{game_name}] Warning: JS extraction failed: {e}")
+                raw_players = []
+
+            for p in raw_players:
+                if p and p.get("name") and p.get("score"):
+                    players.append(
+                        {
+                            "rank": len(players) + 1,
+                            "name": p["name"].strip(),
+                            "score": p["score"].strip(),
+                        }
+                    )
+                    print(
+                        f"      [{game_name}] {players[-1]['rank']}. {players[-1]['name']} -- {players[-1]['score']}"
+                    )
         except Exception as e:
-            print(f"  Warning: Error on leaderboard page: {e}")
+            print(f"  [{game_name}] Warning: Error on leaderboard page: {e}")
             players = []
 
         # Reconcile "You" between the two pages
@@ -374,11 +573,11 @@ class LinkedInLeaderboardScraper:
         if you_entry:
             if user_score_results and you_entry["score"] != user_score_results:
                 print(
-                    f"  Note: Using leaderboard score ({you_entry['score']}) for 'You' "
+                    f"  [{game_name}] Note: Using leaderboard score ({you_entry['score']}) for 'You' "
                     f"(results page had {user_score_results})"
                 )
         elif user_score_results:
-            print(f"  Adding 'You' from results page: {user_score_results}")
+            print(f"  [{game_name}] Adding 'You' from results page: {user_score_results}")
             players.insert(0, {"rank": 0, "name": "You", "score": user_score_results})
 
         if failures:
@@ -386,14 +585,14 @@ class LinkedInLeaderboardScraper:
 
         if players:
             self.all_leaderboard_data[game_name] = players
-            print(f"  OK: {len(players)} player(s) recorded for {game_name}.")
+            print(f"  [{game_name}] OK: {len(players)} player(s) recorded.")
             return True
         else:
-            print(f"  FAIL: No data found for {game_name}.")
+            print(f"  [{game_name}] FAIL: No data found.")
             return False
 
     # ------------------------------------------------------------------
-    # Scrape all games -- pinpoint first, exit early on failure
+    # Scrape all games -- pinpoint first on main tab, then parallel tabs
     # ------------------------------------------------------------------
 
     async def scrape_all_games(self):
@@ -401,21 +600,33 @@ class LinkedInLeaderboardScraper:
         print("Starting leaderboard scraping")
         print("=" * 60)
 
-        game_items = list(GAMES.items())  # pinpoint is first by construction
+        game_items = list(GAMES.items())
+        pinpoint_key, pinpoint_name = game_items[0]
 
-        for i, (game_key, game_name) in enumerate(game_items):
-            success = await self.scrape_game(game_key, game_name)
+        # 1. Scrape Pinpoint first on the single primary page
+        success = await self.scrape_game(self.page, pinpoint_key, pinpoint_name)
+        if not success:
+            print(
+                "\nFAIL: Pinpoint scrape failed. This usually means LinkedIn's page "
+                "structure has changed or you are not logged in."
+            )
+            print("  Exiting early -- no data written.")
+            self._print_failure_summary()
+            return False
 
-            if i == 0 and not success:
-                print(
-                    "\nFAIL: Pinpoint scrape failed. This usually means LinkedIn's page "
-                    "structure has changed or you are not logged in."
-                )
-                print("  Exiting early -- no data written.")
-                self._print_failure_summary()
-                return False
+        # 2. Scrape all remaining games concurrently in separate browser tabs
+        remaining_games = game_items[1:]
+        print(f"\nPinpoint successful. Scraping remaining {len(remaining_games)} games in parallel tabs...")
 
-            await asyncio.sleep(1.5)  # polite delay between games
+        async def worker(game_key, game_name):
+            tab = await self.browser.new_page()
+            try:
+                return await self.scrape_game(tab, game_key, game_name)
+            finally:
+                await tab.close()
+
+        tasks = [worker(k, v) for k, v in remaining_games]
+        await asyncio.gather(*tasks)
 
         self._print_failure_summary()
         return True
