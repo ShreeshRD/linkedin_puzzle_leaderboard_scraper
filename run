@@ -1,1 +1,5 @@
-PYENV_VERSION=tran python lkdin_leaderboard_scraper.py
+#!/usr/bin/bash
+cd /home/arch/programs/automations/linkedin_scraper
+
+# Call the exact pyenv python executable directly
+/home/arch/.pyenv/versions/tran/bin/python lkdin_leaderboard_scraper.py --headless

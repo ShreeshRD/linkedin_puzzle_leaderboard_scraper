@@ -12,6 +12,14 @@ Fix changelog:
 - User score extracted from .pr-golden-chiclet__text (the big number/time shown on results page)
 - Leaderboard scrape targets .pr-connections-leaderboard__content for ranked players
 - Fixed "You" detection: name is in .pr-connections-leaderboard-player__content-column .text-body-medium-bold
+- Fixed duplicate-row bug: LinkedIn renders the "You" row twice on the
+  leaderboard page (pinned + at actual rank), so the scraper could collect
+  two "You" entries in one run. pd.merge() with a non-unique key does a
+  Cartesian match, so those duplicates multiplied every day (1x2=2, 2x2=4,
+  4x4=16, ...). Now: (1) "You" rows are collapsed to one right after
+  scraping, (2) a general per-name dedupe runs as a safety net, and
+  (3) export_to_excel dedupes both the freshly-scraped data and the
+  existing sheet before merging, via dedupe_by_player_name().
 """
 
 import asyncio
@@ -57,6 +65,19 @@ def clean_score(text: str) -> str:
     return re.sub(r"^['`\u2019]+", "", text.strip()).strip()
 
 
+def dedupe_by_player_name(df: pd.DataFrame) -> pd.DataFrame:
+    """Collapse rows that share a 'Player Name' into a single row.
+
+    Uses groupby().first(), which keeps the first *non-null* value in each
+    date column across the duplicate rows, rather than naively dropping
+    duplicates and risking loss of data from a row whose duplicate had a
+    different column populated.
+    """
+    if df.empty or "Player Name" not in df.columns:
+        return df
+    return df.groupby("Player Name", as_index=False, sort=False).first()
+
+
 def parse_time_seconds(score: str) -> float:
     """Convert M:SS to float seconds for sorting. Returns large number on failure."""
     m = re.match(r"^(\d+):(\d{2})$", score.strip())
@@ -74,7 +95,7 @@ def parse_time_seconds(score: str) -> float:
 
 
 class LinkedInLeaderboardScraper:
-    def __init__(self, browser_executable_path=None, headless=False):
+    def __init__(self, browser_executable_path=None, headless=True):
         self.browser_executable_path = browser_executable_path or "/usr/bin/brave"
         self.headless = headless
         self.browser = None
@@ -568,17 +589,44 @@ class LinkedInLeaderboardScraper:
             print(f"  [{game_name}] Warning: Error on leaderboard page: {e}")
             players = []
 
-        # Reconcile "You" between the two pages
-        you_entry = next((p for p in players if p["name"].lower() == "you"), None)
-        if you_entry:
+        # Reconcile "You" between the two pages.
+        # LinkedIn's leaderboard page often renders the "You" row twice (a
+        # pinned/sticky copy plus the row at your actual rank), so `players`
+        # can contain more than one "You" entry here. Collapse them to a
+        # single entry -- this is what was causing rows to multiply on every
+        # merge in export_to_excel.
+        you_entries = [p for p in players if p["name"].lower() == "you"]
+        if you_entries:
+            you_entry = you_entries[0]
+            if len(you_entries) > 1:
+                print(
+                    f"  [{game_name}] Note: Found {len(you_entries)} 'You' rows on the "
+                    f"leaderboard page; collapsing to one."
+                )
             if user_score_results and you_entry["score"] != user_score_results:
                 print(
                     f"  [{game_name}] Note: Using leaderboard score ({you_entry['score']}) for 'You' "
                     f"(results page had {user_score_results})"
                 )
+            # Drop every "You" row, then re-add exactly one.
+            players = [p for p in players if p["name"].lower() != "you"]
+            players.insert(0, you_entry)
         elif user_score_results:
             print(f"  [{game_name}] Adding 'You' from results page: {user_score_results}")
             players.insert(0, {"rank": 0, "name": "You", "score": user_score_results})
+
+        # Safety net: also dedupe by name generally (any other player whose
+        # row got matched by more than one container), keeping the first
+        # occurrence, since names are otherwise treated as the merge key.
+        seen_names = set()
+        deduped_players = []
+        for p in players:
+            key = p["name"].strip().lower()
+            if key in seen_names:
+                continue
+            seen_names.add(key)
+            deduped_players.append(p)
+        players = deduped_players
 
         if failures:
             self.scrape_failures[game_name] = failures
@@ -698,10 +746,19 @@ class LinkedInLeaderboardScraper:
                 )
 
             new_df = pd.DataFrame(new_records)
+            # Safety net: pd.merge on a key that isn't unique on both sides
+            # does a Cartesian match (1 row x 2 rows -> 2 rows, 2x2 -> 4, ...),
+            # which is how duplicate "Player Name" rows compounded over time.
+            # Dedupe today's records before they ever reach the merge.
+            new_df = dedupe_by_player_name(new_df)
 
             if game_name in all_sheets:
                 df = all_sheets[game_name].copy()
                 df["Player Name"] = df["Player Name"].astype(str).str.strip()
+                # Also dedupe the existing sheet on load, so any duplicates
+                # already sitting in the file (from before this fix) can't
+                # keep multiplying on subsequent runs.
+                df = dedupe_by_player_name(df)
                 if date_str in df.columns:
                     df = df.drop(columns=[date_str])
                 updated_df = pd.merge(df, new_df, on="Player Name", how="outer")
