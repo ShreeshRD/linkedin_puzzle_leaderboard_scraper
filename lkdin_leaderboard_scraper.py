@@ -20,6 +20,13 @@ Fix changelog:
   scraping, (2) a general per-name dedupe runs as a safety net, and
   (3) export_to_excel dedupes both the freshly-scraped data and the
   existing sheet before merging, via dedupe_by_player_name().
+- Fixed headless mode hanging at the login step: Chromium advertised
+  "HeadlessChrome" in its user agent, so LinkedIn's Cloudflare bot check
+  served a "Just a moment..." challenge instead of the feed. Headless now
+  uses a normal desktop Chrome UA (version read from the browser binary).
+- Fixed "MANUAL LOGIN REQUIRED" being printed even when already logged in:
+  login state is checked first (li_at cookie / feed URL / nav markers) and
+  the message is only shown when a login is actually needed.
 """
 
 import asyncio
@@ -27,6 +34,7 @@ import re
 import argparse
 import os
 import sys
+import subprocess
 import datetime
 import pandas as pd
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
@@ -63,6 +71,42 @@ def clean_score(text: str) -> str:
     if not text:
         return ""
     return re.sub(r"^['`\u2019]+", "", text.strip()).strip()
+
+
+def desktop_user_agent(executable_path: str) -> str:
+    """Build a normal desktop Chrome UA matching the installed browser version.
+
+    Brave/Chromium in headless mode reports ``HeadlessChrome/<version>`` in its
+    user agent, which LinkedIn's Cloudflare bot check challenges with a
+    "Just a moment..." page. Presenting the equivalent headed UA avoids that
+    while keeping the real browser version intact.
+    """
+    major = None
+    try:
+        out = subprocess.run(
+            [executable_path, "--version"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        ).stdout
+        m = re.search(r"(\d+)\.\d+\.\d+", out)
+        if m:
+            major = m.group(1)
+    except Exception:
+        pass
+    major = major or "157"
+
+    if sys.platform.startswith("linux"):
+        platform_token = "X11; Linux x86_64"
+    elif sys.platform == "darwin":
+        platform_token = "Macintosh; Intel Mac OS X 10_15_7"
+    else:
+        platform_token = "Windows NT 10.0; Win64; x64"
+
+    return (
+        f"Mozilla/5.0 ({platform_token}) AppleWebKit/537.36 "
+        f"(KHTML, like Gecko) Chrome/{major}.0.0.0 Safari/537.36"
+    )
 
 
 def dedupe_by_player_name(df: pd.DataFrame) -> pd.DataFrame:
@@ -110,11 +154,21 @@ class LinkedInLeaderboardScraper:
 
     async def setup_browser(self, playwright):
         print(f"Using user data directory: {self.user_data_dir}")
+        launch_args = ["--no-sandbox", "--disable-dev-shm-usage"]
+        launch_kwargs = {}
+        if self.headless:
+            # Without this, Chromium advertises "HeadlessChrome" in its UA and
+            # LinkedIn serves a Cloudflare bot challenge instead of the feed.
+            launch_kwargs["user_agent"] = desktop_user_agent(
+                self.browser_executable_path
+            )
+            launch_args.append("--disable-blink-features=AutomationControlled")
         self.browser = await playwright.chromium.launch_persistent_context(
             self.user_data_dir,
             executable_path=self.browser_executable_path,
             headless=self.headless,
-            args=["--no-sandbox", "--disable-dev-shm-usage"],
+            args=launch_args,
+            **launch_kwargs,
         )
         print("Successfully launched Brave browser with persistent context.")
 
@@ -129,14 +183,51 @@ class LinkedInLeaderboardScraper:
     # Login helper
     # ------------------------------------------------------------------
 
+    async def is_logged_in(self):
+        """Return True when LinkedIn is showing an authenticated session."""
+        try:
+            url = (self.page.url or "").lower()
+            # Login/auth pages can contain "feed" in a redirect query string,
+            # so reject them before looking at cookie/nav markers.
+            if any(p in url for p in ("/login", "/authwall", "/checkpoint", "/uas/")):
+                return False
+
+            # The li_at cookie is LinkedIn's session cookie; it is the most
+            # reliable signal and doesn't depend on page markup.
+            try:
+                cookies = await self.browser.cookies("https://www.linkedin.com")
+                if any(c.get("name") == "li_at" and c.get("value") for c in cookies):
+                    return True
+            except Exception:
+                pass
+
+            if "/feed" in url:
+                return True
+            return bool(
+                await self.page.query_selector(
+                    "#global-nav, .global-nav__primary-link, .global-nav__me"
+                )
+            )
+        except Exception:
+            return False
+
     async def wait_for_login(self, timeout=120):
-        # ... (keep your existing check for being logged in)
+        if await self.is_logged_in():
+            print("Logged in to LinkedIn.")
+            return True
 
         print("\n" + "=" * 60)
         print(f"MANUAL LOGIN REQUIRED (Timeout: {timeout} seconds)")
-        print("Please log in to LinkedIn. The script will continue automatically.")
+        if self.headless:
+            print(
+                "Running headless: manual login is not possible in this window. "
+                "If the saved session has expired, run once without --headless to log in."
+            )
+        else:
+            print("Please log in to LinkedIn. The script will continue automatically.")
         print("=" * 60 + "\n")
 
+        warned_challenge = False
         start_time = asyncio.get_event_loop().time()
         while asyncio.get_event_loop().time() - start_time < timeout:
             try:
@@ -144,18 +235,29 @@ class LinkedInLeaderboardScraper:
                 if not self.browser:
                     print("Browser context closed. Exiting.")
                     return False
-                
+
                 # Check for successful login
-                url = self.page.url
-                if "feed" in url or await self.page.query_selector("#global-nav"):
+                if await self.is_logged_in():
                     print("Login detected!")
                     await asyncio.sleep(1)
                     return True
+
+                if not warned_challenge:
+                    try:
+                        if await self.page.query_selector(
+                            "#challenge-form, .cf-challenge-running, #cf-challenge-running"
+                        ) or "just a moment" in (await self.page.title()).lower():
+                            warned_challenge = True
+                            print(
+                                "LinkedIn is showing a bot/security check; waiting for it to pass..."
+                            )
+                    except Exception:
+                        pass
             except Exception as e:
                 # Instead of sys.exit(), print the error and wait
                 print(f"Error checking login status: {e}")
-            
-            await asyncio.sleep(2) # Increased sleep to keep CPU usage low
+
+            await asyncio.sleep(2)  # Increased sleep to keep CPU usage low
 
         print("\nLogin timeout reached.")
         return False
